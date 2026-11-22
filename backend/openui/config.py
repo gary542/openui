@@ -119,6 +119,29 @@ OPENAI_MODELS = [
 ]
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Generic OpenAI compatible provider (DeepSeek by default). With the LiteLLM proxy
+# these two variables feed LiteLLM's config; when LiteLLM is disabled (serverless)
+# OpenUI calls the endpoint directly and lists COMPATIBLE_MODELS in the UI.
+OPENAI_COMPATIBLE_API_KEY = os.getenv("OPENAI_COMPATIBLE_API_KEY")
+OPENAI_COMPATIBLE_ENDPOINT = os.getenv(
+    "OPENAI_COMPATIBLE_ENDPOINT", "https://api.deepseek.com"
+)
+COMPATIBLE_MODELS = [
+    m.strip()
+    for m in os.getenv("OPENUI_COMPATIBLE_MODELS", "deepseek-flash,deepseek-v4-pro").split(
+        ","
+    )
+    if m.strip()
+]
+# DeepSeek models think by default, which delays the first streamed token. Off
+# unless OPENUI_COMPATIBLE_THINKING=true.
+COMPATIBLE_THINKING = _flag("OPENUI_COMPATIBLE_THINKING")
+# The {"thinking": ...} request field is DeepSeek specific; other endpoints may
+# reject unknown fields, so only send it to DeepSeek unless forced.
+COMPATIBLE_SEND_THINKING = _flag(
+    "OPENUI_COMPATIBLE_SEND_THINKING", "deepseek" in OPENAI_COMPATIBLE_ENDPOINT
+)
+COMPATIBLE_DIRECT = bool(OPENAI_COMPATIBLE_API_KEY) and not LITELLM_ENABLED
 LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", os.getenv("LITELLM_MASTER_KEY"))
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://0.0.0.0:4000")
 PORT = int(os.getenv("PORT", 7878))

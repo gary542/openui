@@ -101,6 +101,13 @@ else:
 
 ollama = AsyncClient()
 ollama_openai = AsyncOpenAI(base_url=config.OLLAMA_HOST + "/v1", api_key="xxx")
+if config.COMPATIBLE_DIRECT:
+    compatible = AsyncOpenAI(
+        base_url=config.OPENAI_COMPATIBLE_ENDPOINT,
+        api_key=config.OPENAI_COMPATIBLE_API_KEY,
+    )
+else:
+    compatible = None
 router = APIRouter()
 session_store = DBSessionStore()
 github_sso = None
@@ -240,6 +247,28 @@ async def chat_completions(
             response: AsyncStream[
                 ChatCompletionChunk
             ] = await groq.chat.completions.create(
+                **data,
+            )
+            return StreamingResponse(
+                openai_stream_generator(response, input_tokens, user_id, 1),
+                media_type="text/event-stream",
+            )
+        # OpenAI compatible provider (DeepSeek) called directly, no LiteLLM proxy
+        elif compatible is not None and data.get("model").startswith(
+            ("litellm/", "deepseek/")
+        ):
+            data["model"] = data["model"].split("/", 1)[1]
+            if config.COMPATIBLE_MODELS and data["model"] not in config.COMPATIBLE_MODELS:
+                raise HTTPException(status_code=400, detail="Model not supported")
+            if config.COMPATIBLE_SEND_THINKING:
+                data["extra_body"] = {
+                    "thinking": {
+                        "type": "enabled" if config.COMPATIBLE_THINKING else "disabled"
+                    }
+                }
+            response: AsyncStream[
+                ChatCompletionChunk
+            ] = await compatible.chat.completions.create(
                 **data,
             )
             return StreamingResponse(
@@ -504,6 +533,12 @@ async def vote(request: Request, payload: VoteRequest):
 
 
 async def get_openai_models():
+    if (
+        config.OPENAI_API_KEY in ("", "xxx")
+        and config.OPENAI_BASE_URL == "https://api.openai.com/v1"
+    ):
+        # No OpenAI key configured (e.g. DeepSeek only): don't hit the network
+        return []
     try:
         await openai.models.list()
         # We only support 3.5 and 4 for now
@@ -538,6 +573,10 @@ async def get_groq_models():
 
 
 async def get_litellm_models():
+    if compatible is not None:
+        # Listed in the "litellm" group, which the UI already knows how to
+        # select (and falls back to when no OpenAI models are available).
+        return [{"id": m, "object": "model"} for m in config.COMPATIBLE_MODELS]
     if not config.LITELLM_ENABLED:
         return []
     try:

@@ -74,6 +74,7 @@ def test_tables_exist(client):
     } <= names
 
 
+@pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="needs OPENAI_API_KEY (mock)")
 def test_chat_stream_records_usage(client):
     r = client.post(
         "/v1/chat/completions",
@@ -95,7 +96,9 @@ def test_disabled_providers(client):
     )
     assert r.status_code == 400
     models = client.get("/v1/models").json()["models"]
-    assert models["ollama"] == [] and models["litellm"] == []
+    assert models["ollama"] == []
+    if not os.getenv("OPENAI_COMPATIBLE_API_KEY"):
+        assert models["litellm"] == []
 
 
 def test_share_roundtrip(client):
@@ -132,3 +135,39 @@ def test_missing_session_key_fails_clearly():
     )
     assert p.returncode != 0
     assert "OPENUI_SESSION_KEY is required" in p.stderr
+
+
+compatible = pytest.mark.skipif(
+    not os.getenv("OPENAI_COMPATIBLE_API_KEY"),
+    reason="needs OPENAI_COMPATIBLE_API_KEY / OPENAI_COMPATIBLE_ENDPOINT (mock)",
+)
+
+
+@compatible
+def test_compatible_provider_listed_and_default_selectable(client):
+    models = client.get("/v1/models").json()["models"]
+    ids = [m["id"] for m in models["litellm"]]
+    assert "deepseek-flash" in ids and "deepseek-v4-pro" in ids
+    if not os.getenv("OPENAI_API_KEY"):
+        # no OpenAI key: the UI falls back to the first "litellm" model
+        assert models["openai"] == []
+
+
+@compatible
+def test_compatible_provider_streams_with_thinking_off(client):
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "litellm/deepseek-flash",
+            "stream": True,
+            "messages": [{"role": "user", "content": "a card"}],
+        },
+    )
+    assert r.status_code == 200
+    assert "hello" in r.text and "[DONE]" in r.text
+    assert "thinking=disabled" in r.text and "model=deepseek-flash" in r.text
+    bad = client.post(
+        "/v1/chat/completions",
+        json={"model": "litellm/not-a-model", "messages": [{"role": "user", "content": "x"}]},
+    )
+    assert bad.status_code == 400
