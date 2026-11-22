@@ -15,17 +15,20 @@ class SessionData(BaseModel):
     model: Optional[str] = ""
 
 
-now = datetime.datetime.now()
-cutoff = now - datetime.timedelta(days=7)
-
-
 class DBSessionStore:
     def __init__(self):
-        # TODO: This is not the ideal place to be migrating
-        ensure_migrated()
-        self.cleanup()
+        self._ready = False
+
+    def ensure_ready(self):
+        # Migrate and prune lazily, on first use, so importing the app never
+        # needs a database connection (important for serverless cold starts).
+        if not self._ready:
+            ensure_migrated()
+            self.cleanup()
+            self._ready = True
 
     def cleanup(self):
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=7)
         Session.delete().where(Session.created_at < cutoff).execute()
 
     @classmethod
@@ -33,6 +36,7 @@ class DBSessionStore:
         return Session.get_or_none(Session.id == uuid.UUID(session_id).bytes)
 
     def get(self, session_id: str) -> Optional[SessionData]:
+        self.ensure_ready()
         if session_id:
             session = Session.get_or_none(Session.id == uuid.UUID(session_id).bytes)
         else:
@@ -55,6 +59,7 @@ class DBSessionStore:
             )
 
     def write(self, session_id: str, user_id: str, data: SessionData):
+        self.ensure_ready()
         Session.insert(
             id=uuid.UUID(session_id).bytes,
             user_id=uuid.UUID(user_id).bytes,

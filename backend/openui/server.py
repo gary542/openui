@@ -8,13 +8,11 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
-from botocore.exceptions import ClientError
 from fastapi.routing import APIRouter
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi_sso.sso.github import GithubSSO
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import html
@@ -27,7 +25,6 @@ import time
 import getpass
 from peewee import IntegrityError
 
-import weave
 from starlette.middleware.sessions import SessionMiddleware
 from .session import DBSessionStore, SessionData
 from .logs import logger
@@ -35,8 +32,9 @@ from .models import count_tokens, ShareRequest, VoteRequest
 from .ollama import ollama_stream_generator, openai_to_ollama
 from .openai import openai_stream_generator
 from .dummy import DummyStreamGenerator
-from .db.models import User, Usage, Vote, Component
+from .db.models import User, Usage, Vote, Component, database
 from .util import storage
+from .util.storage import ShareNotFound, InvalidShareId
 from .util import get_git_user_email
 from . import config
 from pydantic import ValidationError
@@ -62,6 +60,26 @@ async def lifespan(app: FastAPI):
 
 queue: Optional[Queue] = None
 
+
+class DatabaseConnectionMiddleware:
+    """Close the Postgres connection once a request (including any streamed
+    response body) has finished, so serverless instances never sit on a pooler
+    connection. peewee reconnects lazily on the next query."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if scope["type"] == "http" and config.DATABASE_URL and not database.is_closed():
+                try:
+                    database.close()
+                except Exception:  # pragma: no cover - best effort
+                    logger.warning("Failed to close database connection", exc_info=True)
+
+
 app = FastAPI(
     docs_url="/docs",
     title="OpenUI API",
@@ -83,12 +101,89 @@ else:
 
 ollama = AsyncClient()
 ollama_openai = AsyncOpenAI(base_url=config.OLLAMA_HOST + "/v1", api_key="xxx")
+if config.COMPATIBLE_DIRECT:
+    compatible = AsyncOpenAI(
+        base_url=config.OPENAI_COMPATIBLE_ENDPOINT,
+        api_key=config.OPENAI_COMPATIBLE_API_KEY,
+    )
+else:
+    compatible = None
 router = APIRouter()
 session_store = DBSessionStore()
-github_sso = GithubSSO(
-    config.GITHUB_CLIENT_ID, config.GITHUB_CLIENT_SECRET, f"{config.HOST}/v1/callback"
-)
+github_sso = None
 
+
+def get_github_sso():
+    # Imported lazily: GitHub login is disabled in single user mode.
+    global github_sso
+    if github_sso is None:
+        from fastapi_sso.sso.github import GithubSSO
+
+        github_sso = GithubSSO(
+            config.GITHUB_CLIENT_ID,
+            config.GITHUB_CLIENT_SECRET,
+            f"{config.HOST}/v1/callback",
+        )
+    return github_sso
+
+
+def start_session(request: Request, user: User, session_id: Optional[str] = None):
+    session_id = session_id or session_store.generate_session_id()
+    request.session["session_id"] = session_id
+    request.session["user_id"] = str(user.id)
+    session_store.write(
+        session_id,
+        str(user.id),
+        SessionData(
+            username=user.username,
+            token_count=0,
+            max_tokens=config.MAX_TOKENS,
+            email=user.email,
+        ),
+    )
+    return session_id
+
+
+def get_or_create_user(username: str, email: Optional[str] = None) -> User:
+    session_store.ensure_ready()
+    user = User.get_or_none(User.username == username)
+    if user is None:
+        user_id = uuid.uuid4()
+        try:
+            user = User.create(
+                id=user_id.bytes,
+                username=username,
+                email=email,
+                created_at=datetime.now(),
+            )
+            user.id = user_id
+        except IntegrityError:
+            user = User.get(User.username == username)
+    if user.email is None and email:
+        user.email = email
+        user.save()
+    return user
+
+
+def auto_session_username() -> str:
+    # Single user mode (behind Vercel Authentication etc.) uses a fixed owner
+    # account; plain local runs use the OS user like upstream.
+    return config.SINGLE_USER_NAME if config.SINGLE_USER else getpass.getuser()
+
+
+def current_user_id(request: Request) -> str:
+    """The logged in user's id. In single user mode a session is created on
+    demand for the owner account."""
+    user_id = request.session.get("user_id")
+    if user_id is None and config.SINGLE_USER:
+        user = get_or_create_user(config.SINGLE_USER_NAME)
+        start_session(request, user)
+        user_id = request.session["user_id"]
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Login required to use OpenUI")
+    return user_id
+
+app.add_middleware(DatabaseConnectionMiddleware)
 app.add_middleware(
     SessionMiddleware,
     # TODO: replace with something random
@@ -114,9 +209,8 @@ async def chat_completions(
     # chat_request: CompletionCreateParams,  # TODO: lots' fo weirdness here, just using raw json
     # ctx: Any = Depends(weave_context),
 ):
-    if request.session.get("user_id") is None:
-        raise HTTPException(status_code=401, detail="Login required to use OpenUI")
-    user_id = request.session["user_id"]
+    session_store.ensure_ready()
+    user_id = current_user_id(request)
     yesterday = datetime.now() - timedelta(days=1)
     tokens = Usage.tokens_since(user_id, yesterday.date())
     if config.ENV == config.Env.PROD and tokens > config.MAX_TOKENS:
@@ -133,7 +227,7 @@ async def chat_completions(
         # OpenAI Models
         if data.get("model").startswith("gpt"):
             if data["model"] == "gpt-4" or data["model"] == "gpt-4-32k":
-                raise HTTPException(status=400, data="Model not supported")
+                raise HTTPException(status_code=400, detail="Model not supported")
             response: AsyncStream[
                 ChatCompletionChunk
             ] = await openai.chat.completions.create(
@@ -149,7 +243,7 @@ async def chat_completions(
         elif data.get("model").startswith("groq/"):
             data["model"] = data["model"].replace("groq/", "")
             if groq is None:
-                raise HTTPException(status=500, detail="Groq API key is not set.")
+                raise HTTPException(status_code=500, detail="Groq API key is not set.")
             response: AsyncStream[
                 ChatCompletionChunk
             ] = await groq.chat.completions.create(
@@ -159,11 +253,35 @@ async def chat_completions(
                 openai_stream_generator(response, input_tokens, user_id, 1),
                 media_type="text/event-stream",
             )
+        # OpenAI compatible provider (DeepSeek) called directly, no LiteLLM proxy
+        elif compatible is not None and data.get("model").startswith(
+            ("litellm/", "deepseek/")
+        ):
+            data["model"] = data["model"].split("/", 1)[1]
+            if config.COMPATIBLE_MODELS and data["model"] not in config.COMPATIBLE_MODELS:
+                raise HTTPException(status_code=400, detail="Model not supported")
+            if config.COMPATIBLE_SEND_THINKING:
+                data["extra_body"] = {
+                    "thinking": {
+                        "type": "enabled" if config.COMPATIBLE_THINKING else "disabled"
+                    }
+                }
+            response: AsyncStream[
+                ChatCompletionChunk
+            ] = await compatible.chat.completions.create(
+                **data,
+            )
+            return StreamingResponse(
+                openai_stream_generator(response, input_tokens, user_id, 1),
+                media_type="text/event-stream",
+            )
         # Litellm Models
         elif data.get("model").startswith("litellm/"):
             data["model"] = data["model"].replace("litellm/", "")
-            if litellm is None:
-                raise HTTPException(status=500, detail="LiteLLM API key is not set.")
+            if not config.LITELLM_ENABLED:
+                raise HTTPException(
+                    status_code=400, detail="LiteLLM is disabled on this deployment."
+                )
             response: AsyncStream[
                 ChatCompletionChunk
             ] = await litellm.chat.completions.create(
@@ -175,6 +293,10 @@ async def chat_completions(
             )
         # Ollama Time
         elif data.get("model").startswith("ollama/"):
+            if not config.OLLAMA_ENABLED:
+                raise HTTPException(
+                    status_code=400, detail="Ollama is disabled on this deployment."
+                )
             data["model"] = data["model"].replace("ollama/", "")
             data.pop("max_tokens")
             data["messages"] = openai_to_ollama(data)
@@ -205,7 +327,7 @@ async def chat_completions(
             return StreamingResponse(
                 DummyStreamGenerator(data), media_type="text/event-stream"
             )
-        raise HTTPException(status=404, detail="Invalid model")
+        raise HTTPException(status_code=404, detail="Invalid model")
     except (ResponseError, APIStatusError) as e:
         traceback.print_exc()
         logger.exception("Known Error: %s", str(e))
@@ -237,28 +359,51 @@ async def validation_exception_handler(
     )
 
 
-@app.exception_handler(ClientError)
-async def boto3_error_handler(request: Request, exc: ClientError):
-    logger.exception("Boto3 Error: %s", exc)
-    error_code = exc.response["Error"]["Code"]
-    error_message = exc.response["Error"]["Message"]
+try:
+    from botocore.exceptions import ClientError
+except ImportError:  # boto3 is optional (S3 share storage only)
+    ClientError = None
 
-    status_code_map = {
-        "NoSuchKey": 404,
-        "NoSuchBucket": 404,
-        "AccessDenied": 403,
-        # TODO: maybe add more...
-    }
-    status_code = status_code_map.get(error_code, 500)
+if ClientError is not None:
 
+    @app.exception_handler(ClientError)
+    async def boto3_error_handler(request: Request, exc: ClientError):
+        logger.exception("Boto3 Error: %s", exc)
+        error_code = exc.response["Error"]["Code"]
+        error_message = exc.response["Error"]["Message"]
+
+        status_code_map = {
+            "NoSuchKey": 404,
+            "NoSuchBucket": 404,
+            "AccessDenied": 403,
+            # TODO: maybe add more...
+        }
+        status_code = status_code_map.get(error_code, 500)
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "error": {
+                    "code": error_code,
+                    "message": error_message,
+                }
+            },
+        )
+
+
+@app.exception_handler(ShareNotFound)
+async def share_not_found_handler(request: Request, exc: ShareNotFound):
     return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "code": error_code,
-                "message": error_message,
-            }
-        },
+        status_code=404,
+        content={"error": {"code": "NoSuchKey", "message": "Share not found"}},
+    )
+
+
+@app.exception_handler(InvalidShareId)
+async def invalid_share_handler(request: Request, exc: InvalidShareId):
+    return JSONResponse(
+        status_code=400,
+        content={"error": {"code": "invalid_id", "message": str(exc)}},
     )
 
 
@@ -302,10 +447,13 @@ class SessionUpdate(Message):
 async def login(
     request: Request,
 ):
-    with github_sso:
-        return await github_sso.get_login_redirect(
-            redirect_uri=f"{config.HOST}/v1/callback"
+    if config.SINGLE_USER:
+        raise HTTPException(
+            status_code=404, detail="GitHub login is disabled in single user mode"
         )
+    sso = get_github_sso()
+    with sso:
+        return await sso.get_login_redirect(redirect_uri=f"{config.HOST}/v1/callback")
 
 
 @router.get("/v1/callback", tags="openui/oauth")
@@ -328,22 +476,13 @@ async def callback(request: Request, error: str = "", error_description: str = "
             elif error == "access_denied":
                 message = "You've denied us access to verify your email with GitHub."
             raise ValueError(message)
-        with github_sso:
-            id_token = await github_sso.verify_and_process(request)
+        if config.SINGLE_USER:
+            raise ValueError("GitHub login is disabled in single user mode")
+        sso = get_github_sso()
+        with sso:
+            id_token = await sso.verify_and_process(request)
         # TODO: should probably key off email / update info
-        user = User.get_or_none(User.username == id_token.display_name)
-        if user is None:
-            user_id = uuid.uuid4()
-            user = User.create(
-                id=user_id.bytes,
-                username=id_token.display_name,
-                email=id_token.email,
-                created_at=datetime.now(),
-            )
-            user.id = user_id
-        elif not user.email:
-            user.email = id_token.email
-            user.save()
+        user = get_or_create_user(id_token.display_name, id_token.email)
         request.session["session_id"] = session_store.generate_session_id()
         request.session["user_id"] = str(user.id)
         session_store.write(
@@ -363,7 +502,8 @@ async def callback(request: Request, error: str = "", error_description: str = "
     status_code=status.HTTP_201_CREATED,
     tags="openui/create_share",
 )
-async def create_share(id: str, payload: ShareRequest):
+async def create_share(request: Request, id: str, payload: ShareRequest):
+    current_user_id(request)
     storage.upload(f"{id}.json", payload.model_dump_json())
     return payload
 
@@ -375,15 +515,16 @@ async def get_share(id: str):
 
 @router.post("/v1/vote", status_code=status.HTTP_201_CREATED, tags="openui/vote")
 async def vote(request: Request, payload: VoteRequest):
+    user_id = current_user_id(request)
     component = Component.create(
         id=uuid.uuid4().bytes,
-        user_id=uuid.UUID(request.session["user_id"]).bytes,
+        user_id=uuid.UUID(user_id).bytes,
         name=payload.name,
         data=payload.model_dump(),
     )
     Vote.create(
         id=uuid.uuid4().bytes,
-        user_id=uuid.UUID(request.session["user_id"]).bytes,
+        user_id=uuid.UUID(user_id).bytes,
         component_id=component.id,
         vote=payload.vote,
         created_at=datetime.now(),
@@ -392,9 +533,17 @@ async def vote(request: Request, payload: VoteRequest):
 
 
 async def get_openai_models():
+    if (
+        config.OPENAI_API_KEY in ("", "xxx")
+        and config.OPENAI_BASE_URL == "https://api.openai.com/v1"
+    ):
+        # No OpenAI key configured (e.g. DeepSeek only): don't hit the network
+        return []
     try:
         await openai.models.list()
         # We only support 3.5 and 4 for now
+        if config.OPENAI_MODELS:
+            return config.OPENAI_MODELS
         return ["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o", "gpt-4-turbo"]
     except Exception:
         logger.warning("Couldn't connect to OpenAI at %s", config.OPENAI_BASE_URL)
@@ -402,6 +551,8 @@ async def get_openai_models():
 
 
 async def get_ollama_models():
+    if not config.OLLAMA_ENABLED:
+        return []
     try:
         return (await ollama.list())["models"]
     except Exception:
@@ -410,6 +561,8 @@ async def get_ollama_models():
 
 
 async def get_groq_models():
+    if groq is None:
+        return []
     try:
         return [
             d for d in (await groq.models.list()).data if not d.id.startswith("whisper")
@@ -420,6 +573,12 @@ async def get_groq_models():
 
 
 async def get_litellm_models():
+    if compatible is not None:
+        # Listed in the "litellm" group, which the UI already knows how to
+        # select (and falls back to when no OpenAI models are available).
+        return [{"id": m, "object": "model"} for m in config.COMPATIBLE_MODELS]
+    if not config.LITELLM_ENABLED:
+        return []
     try:
         return (await litellm.models.list()).data
     except Exception:
@@ -455,40 +614,17 @@ async def models():
 async def get_session(
     request: Request,
 ):
+    session_store.ensure_ready()
     session_id = request.session.get("session_id")
     if session_id is None:
-        if config.ENV == config.Env.LOCAL:
-            # Give local users a session automatically
-            session_id = session_store.generate_session_id()
-            request.session["session_id"] = session_id
-            user_id = uuid.uuid4()
-            try:
-                user = User.get_or_none(User.username == getpass.getuser())
-                if user is None:
-                    user = User.create(
-                        username=getpass.getuser(),
-                        created_at=datetime.now(),
-                        id=user_id.bytes,
-                    )
-                else:
-                    user_id = user.id
-            except IntegrityError:
-                user = User.get(User.username == getpass.getuser())
-                user_id = user.id
-            if user.email is None:
-                user.email = get_git_user_email()
-                user.save()
-            request.session["user_id"] = str(user_id)
-            session_store.write(
-                request.session["session_id"],
-                str(user_id),
-                SessionData(
-                    username=user.username,
-                    token_count=0,
-                    max_tokens=config.MAX_TOKENS,
-                    email=user.email,
-                ),
+        if config.ENV == config.Env.LOCAL or config.SINGLE_USER:
+            # Give local users (and the owner in single user mode) a session
+            # automatically
+            username = auto_session_username()
+            user = get_or_create_user(
+                username, None if config.SINGLE_USER else get_git_user_email()
             )
+            session_id = start_session(request, user)
         else:
             raise HTTPException(status_code=404, detail="No session found")
     session_data = session_store.get(session_id)
@@ -600,7 +736,7 @@ def check_wandb_auth():
     return key is not None
 
 
-wandb_enabled = check_wandb_auth()
+wandb_enabled = False if config.SERVERLESS else check_wandb_auth()
 if wandb_enabled:
     logger.info(f"WANDB_API_KEY found, enabling wandb for {base_url}")
 
@@ -618,6 +754,8 @@ class Server(uvicorn.Server):
 
     def run_with_wandb(self):
         if wandb_enabled:
+            import weave
+
             weave.init(os.getenv("WANDB_PROJECT", "openui-dev"))
         self.run()
 
