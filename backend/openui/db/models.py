@@ -251,12 +251,19 @@ ALL_TABLES = [
 ]
 
 
+def _postgres_tables_exist() -> bool:
+    return all(database.table_exists(model._meta.table_name) for model in ALL_TABLES)
+
+
 def ensure_migrated():
     if POSTGRES:
         # The canonical schema lives in backend/migrations/001_init.sql (run it in
-        # the Supabase SQL editor). create_tables(safe=True) is a no-op when the
-        # tables already exist and keeps local / CI databases working without it.
-        database.create_tables(ALL_TABLES, safe=True)
+        # the Supabase SQL editor). peewee's create_tables(safe=True) is not a
+        # no-op: it still issues CREATE INDEX on existing tables, which requires
+        # table ownership and fails when the tables were created by another role
+        # (e.g. postgres). Skip DDL when the schema is already present.
+        if not _postgres_tables_exist():
+            database.create_tables(ALL_TABLES, safe=True)
         if SchemaMigration.select().first() is None:
             SchemaMigration.create(version=CURRENT_VERSION)
         return

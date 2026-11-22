@@ -50,11 +50,16 @@ for real use), `OPENUI_OPENAI_MODELS` (comma separated model list shown in the U
 
 ## Database
 
-`backend/migrations/001_init.sql` is the schema (also applied by the app with
-`CREATE TABLE IF NOT EXISTS` on first use). RLS is enabled with no policies so the
-Supabase REST API (anon key) cannot read the tables; OpenUI connects directly as
-the `postgres` role. Shared components are stored in the `shares` table (S3 is only
-used if `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are set and `pip install openui[s3]`).
+`backend/migrations/001_init.sql` is the schema. Run it as the Supabase
+`postgres` role, then connect the app as `openui_app` (`DATABASE_URL`). RLS is
+enabled; `openui_app` has an `openui_app_all` policy for DML, and the eight app
+tables (plus their indexes and sequences) are owned by `openui_app` so optional
+app-side DDL can run. The Supabase REST API (anon / authenticated) has no
+policies, so it cannot read the tables. The app skips peewee `create_tables` when
+the tables already exist — `create_tables(safe=True)` still issues `CREATE INDEX`
+and fails without table ownership. Shared components are stored in the `shares`
+table (S3 is only used if `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` are set and
+`pip install openui[s3]`).
 
 Free-tier note: Supabase pauses free projects after a week of inactivity.
 

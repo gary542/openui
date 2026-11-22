@@ -71,9 +71,10 @@ create table if not exists shares (
 );
 
 -- Supabase exposes the public schema through its REST API (PostgREST) using the
--- anon / authenticated keys. OpenUI only talks to Postgres directly (the
--- postgres role, which bypasses RLS), so turn RLS on with no policies: the REST
--- API then returns nothing for these tables.
+-- anon / authenticated keys. Enable RLS so that API has no access without
+-- policies. The app connects as openui_app; grant that role DML and an
+-- openui_app_all policy (see the role setup SQL), then transfer ownership below
+-- so optional app-side DDL can run. anon/authenticated still have no policies.
 alter table schema_migration enable row level security;
 alter table users            enable row level security;
 alter table credentials      enable row level security;
@@ -86,3 +87,37 @@ alter table shares           enable row level security;
 insert into schema_migration (version)
 select '2024-05-14'
 where not exists (select 1 from schema_migration);
+
+-- Transfer ownership to openui_app when that role exists. peewee may still
+-- issue CREATE INDEX on first use; that requires table ownership. Safe to
+-- re-run. PostgreSQL 16+ needs SET OPTION on the membership (GRANT ... WITH
+-- SET TRUE) for ALTER ... OWNER TO to succeed.
+do $$
+declare
+    t text;
+begin
+    if not exists (select 1 from pg_roles where rolname = 'openui_app') then
+        return;
+    end if;
+    if not exists (
+        select 1
+        from pg_auth_members m
+        join pg_roles r on r.oid = m.member
+        join pg_roles g on g.oid = m.roleid
+        where r.rolname = current_user
+          and g.rolname = 'openui_app'
+          and m.set_option
+    ) then
+        execute format(
+            'grant openui_app to %I with set true, inherit false',
+            current_user
+        );
+    end if;
+    foreach t in array array[
+        'schema_migration', 'users', 'credentials', 'sessions',
+        'components', 'votes', 'usage', 'shares'
+    ] loop
+        execute format('alter table public.%I owner to openui_app', t);
+    end loop;
+end $$;
+
