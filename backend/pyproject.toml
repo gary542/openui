@@ -1,15 +1,15 @@
 [project]
 dependencies = [
-    "weave>=0.50.9",
     "openai>=1.12.0",
     "ollama>=0.1.7",
     "itsdangerous>=2.0.1",
     "peewee>=3.0.0",
+    "psycopg2-binary>=2.9.9",
     "fastapi>=0.111.0",
     "uvicorn>=0.22.0",
     "fastapi-sso>=0.10.0",
-    "boto3>=1.34.67",
     "tiktoken>=0.8.0",
+    "requests>=2.31.0",
 ]
 name = "openui"
 version = "0.5.0"
@@ -39,7 +39,20 @@ Issues = "https://github.com/wandb/openui/issues"
 CI = "https://github.com/wandb/openui/actions"
 
 
+[tool.vercel]
+# Vercel runs the FastAPI app exported from app.py (Root Directory = backend).
+# See DEPLOY_VERCEL.md.
+entrypoint = "app:app"
+
+[tool.vercel.scripts]
+build = "python build.py"
+
 [project.optional-dependencies]
+# Weights & Biases tracing (optional, not installed on Vercel)
+weave = ["weave>=0.50.9"]
+# S3 compatible storage for shared components (shares are stored in the
+# database by default)
+s3 = ["boto3>=1.34.67"]
 test = ["pytest", "pre-commit"]
 litellm = ["litellm[proxy]>=1.40.20", "google-generativeai"]
 eval = [

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "app.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{tests/**,openui/eval/**,openui/tui/**,migrations/**,.venv/**}"
+    }
+  },
+  "regions": [
+    "lhr1"
+  ]
+}

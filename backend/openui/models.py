@@ -1,5 +1,13 @@
+import os
+from pathlib import Path
 from pydantic import BaseModel
-import tiktoken
+
+# Ship the cl100k_base encoding with the app so token counting never has to
+# download it at runtime (serverless cold starts, read-only file systems).
+os.environ.setdefault(
+    "TIKTOKEN_CACHE_DIR", str(Path(__file__).parent / "assets" / "tiktoken")
+)
+import tiktoken  # noqa: E402
 
 
 class ShareRequest(BaseModel):
